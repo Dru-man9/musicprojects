@@ -24,8 +24,6 @@ A Python tool that analyzes music artists' **PSR (Performance and Streaming Roya
 
 ### Installation
 
-### Installation
-
 ```bash
 git clone https://github.com/your-username/music-catalogue-analyzer.git
 cd music-catalogue-analyzer
