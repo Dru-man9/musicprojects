@@ -22,28 +22,4 @@ Music Fans & Finance Enthusiasts: People who want to understand the business of 
 Students & Educators: Learn how entertainment finance, data analytics, and investment thinking intersect
 
 
-🚀 Quick Start
-Prerequisites
-
-Python 3.8+
-pip (Python package manager)
-API keys for data sources (see Configuration below)
-
-Installation
-bash# Clone the repository
-git clone https://github.com/your-username/music-catalogue-analyzer.git
-cd music-catalogue-analyzer
-
-# Create a virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Set up your environment variables
-cp .env.example .env
-# Edit .env with your API keys
-Run the Application
-bashpython app.py
 
