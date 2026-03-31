@@ -1,0 +1,779 @@
+from flask import Flask, jsonify, request, render_template_string
+import hashlib, urllib.request, urllib.parse, json as json_mod, re, os
+
+app = Flask(__name__)
+_LOOKUP_CACHE = {}
+_TRACK_CACHE  = {}
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
+def score_album(al):
+    s = 100
+    p = al["psr_multiple"]
+    s -= 0 if p < 12 else 8 if p < 16 else 18 if p < 20 else 30 if p < 24 else 40
+    t = al["stream_trend_3yr"]
+    g = (t[-1] - t[0]) / t[0] if t[0] else 0
+    s -= 0 if g > .15 else 8 if g > .05 else 16 if g > 0 else 30
+    sy = al["sync_placements"]
+    s -= 0 if sy > 1000 else 4 if sy > 500 else 9 if sy > 200 else 15
+    ps = al["publishing_pct"] + al["sync_pct"]
+    s -= 0 if ps > 70 else 4 if ps > 55 else 9 if ps > 40 else 15
+    return max(0, min(100, s))
+
+def verdict(score):
+    if score >= 78: return {"label":"STRONG BUY","color":"green","icon":"▲"}
+    if score >= 62: return {"label":"BUY","color":"teal","icon":"▲"}
+    if score >= 48: return {"label":"MONITOR","color":"yellow","icon":"◆"}
+    if score >= 35: return {"label":"PASS","color":"orange","icon":"▼"}
+    return {"label":"STRONG PASS","color":"red","icon":"▼"}
+
+# ── Deterministic helpers ─────────────────────────────────────────────────────
+def _sv(seed, lo, hi, d=1):
+    n = int(hashlib.md5(str(seed).encode()).hexdigest(), 16)
+    return round(lo + (n % 100_000) / 100_000 * (hi - lo), d)
+def _si(seed, lo, hi): return int(_sv(seed, lo, hi, 0))
+
+_GENRE_SPLITS = {
+    "hip-hop":(30,12,58),"rap":(28,10,62),"r&b":(46,24,30),"soul":(50,28,22),
+    "pop":(38,22,40),"rock":(52,28,20),"alternative":(48,26,26),"indie":(52,28,20),
+    "folk":(58,32,10),"country":(52,26,22),"jazz":(60,34,6),"electronic":(32,16,52),
+}
+def _gsplit(g):
+    g = g.lower()
+    for k, v in _GENRE_SPLITS.items():
+        if k in g: return v
+    return (42, 22, 36)
+
+# ── iTunes fetch ──────────────────────────────────────────────────────────────
+NOISE = re.compile(
+    r'live\b|karaoke|tribute|instrumental|soundtrack|score|\bost\b|'
+    r'the musical|the series|disney|nickelodeon|christmas|holiday|'
+    r'video album|sollos|remixes\b|greatest hits|best of\b|collection\b|anthology|compil',
+    re.IGNORECASE)
+
+def _base(name):
+    n = re.sub(r'\s*[\(\[]?\s*(deluxe|expanded|special|bonus|platinum|anniversary|'
+               r'reissue|extended|complete|super deluxe)[^\)\]]*[\)\]]?', '', name, flags=re.IGNORECASE)
+    return re.sub(r'\s*\(.*?\)\s*$', '', n, flags=re.IGNORECASE).strip().lower()
+
+def _estimate(a, genre):
+    aid = a["collectionId"]
+    year = int(a.get("releaseDate","2020")[:4])
+    tracks = a.get("trackCount", 10)
+    age = max(0, 2025 - year)
+    psr = _sv(aid^(5 if age<=3 else 4 if age<=8 else 3 if age<=15 else 2 if age<=25 else 1),
+              18 if age<=3 else 14.8 if age<=8 else 12.2 if age<=15 else 10.4 if age<=25 else 7.8,
+              28 if age<=3 else 22.6 if age<=8 else 18.4 if age<=15 else 15.8 if age<=25 else 12.5)
+    rev_K = max(50, int(tracks * _sv(aid^6,18,180,0) * max(0.1, 1-age*.018)))
+    sync_pl = _si(aid^7,30,600) + int(age * _sv(aid^8,4,48,0))
+    bs = _sv(aid^9, 0.8, max(1.2, 40-age*0.6), 1)
+    dr = _sv(aid^10, -0.18, 0.32, 3)
+    trend = [round(max(0.1, bs),1), round(max(0.1, bs*(1+dr*.5)),1), round(max(0.1, bs*(1+dr)),1)]
+    pub, sync, rec = _gsplit(genre)
+    j = _si(aid^11, -5, 5)
+    pub = max(20, min(70, pub+j)); sync = max(8, min(40, sync-j//2)); rec = 100-pub-sync
+    g = trend[2] >= trend[0]; pct = abs(round((trend[2]-trend[0])/trend[0]*100))
+    note = (f"Below fair-value ({psr}×). {'Growing +'+str(pct)+'%' if g else 'Flat streams'} — potential entry."
+            if psr < 12 else f"Fair-value ({psr}×). {'Growth +'+str(pct)+'%' if g else 'Stable'}." if psr < 17
+            else f"Premium ({psr}×). {'Justified by +'+str(pct)+'%' if g else 'Monitor stream decline'}." if psr < 22
+            else f"Expensive {psr}×. {'High growth' if g else 'Declining — avoid'}.")
+    return {"itunes_id":aid,"title":a["collectionName"],"year":year,"tracks":tracks,
+            "annual_revenue_K":rev_K,"psr_multiple":psr,"publishing_pct":pub,"sync_pct":sync,
+            "recording_pct":rec,"stream_trend_3yr":trend,"sync_placements":sync_pl,"notes":note}
+
+def _fetch_itunes(name):
+    try:
+        q = urllib.parse.quote(name)
+        with urllib.request.urlopen(f"https://itunes.apple.com/search?term={q}&entity=musicArtist&limit=5&media=music", timeout=10) as r:
+            sr = json_mod.loads(r.read().decode())
+        if not sr.get("resultCount"): return None
+        ar = sr["results"][0]
+        aid, aname, genre = ar["artistId"], ar["artistName"], ar.get("primaryGenreName","Pop")
+        with urllib.request.urlopen(f"https://itunes.apple.com/lookup?id={aid}&entity=album&limit=200", timeout=10) as r:
+            ad = json_mod.loads(r.read().decode())
+        raw = [x for x in ad["results"] if x.get("wrapperType")=="collection"
+               and x.get("artistId")==aid and x.get("trackCount",0)>1
+               and not NOISE.search(x.get("collectionName",""))]
+        groups = {}
+        for a in raw:
+            k = _base(a.get("collectionName",""))
+            groups.setdefault(k,[]).append(a)
+        deduped = []
+        for vs in groups.values():
+            if len(vs)==1: deduped.append(vs[0]); continue
+            vs.sort(key=lambda x: x.get("releaseDate",""))
+            best = max(vs, key=lambda x: x.get("trackCount",0))
+            deduped.append(best if best.get("trackCount",0) > vs[0].get("trackCount",0)+4 else vs[0])
+        albums_raw = sorted(deduped, key=lambda x: x.get("releaseDate",""))
+        if not albums_raw: return None
+        albums_out = []
+        for al in albums_raw:
+            e = _estimate(al, genre)
+            s = score_album(e); e["score"]=s; e["verdict"]=verdict(s)
+            albums_out.append(e)
+        avg = round(sum(a["score"] for a in albums_out)/len(albums_out))
+        initials = "".join(w[0].upper() for w in aname.split()[:2])
+        return {"key":aname.lower().replace(" ","-"),"name":aname,"genre":[genre],
+                "active_years":f"{albums_raw[0].get('releaseDate','????')[:4]}–present",
+                "catalog_size":sum(a.get("trackCount",0) for a in albums_raw),
+                "monthly_streams_M":round(_sv(aid^99,0.8,95.0),1),
+                "image_placeholder":initials,"independent":False,
+                "label":"See iTunes / Streaming Platforms",
+                "bio":f"Live data from iTunes. {len(albums_out)} releases found. PSR figures are modeled estimates.",
+                "simulated":True,"itunes_artist_id":aid,"albums":albums_out,
+                "overall_score":avg,"overall_verdict":verdict(avg)}
+    except Exception as e:
+        app.logger.error(f"iTunes error '{name}': {e}"); return None
+
+# ── Pre-loaded artists ────────────────────────────────────────────────────────
+ARTISTS = {
+    "chance-the-rapper": {
+        "name":"Chance the Rapper","genre":["Hip-Hop","Gospel Rap","Indie"],
+        "active_years":"2011–present","catalog_size":62,"monthly_streams_M":18.4,
+        "image_placeholder":"CR","independent":True,"label":"Self-Released",
+        "bio":"Pioneer of indie streaming-era rap. Owns 100% of masters and publishing. First streaming-only Grammy winner.",
+        "albums":[
+            {"title":"10 Day","year":2012,"tracks":14,"annual_revenue_K":280,"psr_multiple":9.8,
+             "publishing_pct":55,"sync_pct":18,"recording_pct":27,"stream_trend_3yr":[4.2,4.8,5.6],"sync_placements":120,
+             "notes":"Debut — recorded during 10-day suspension. Low multiple, 100% owner-retained."},
+            {"title":"Acid Rap","year":2013,"tracks":13,"annual_revenue_K":620,"psr_multiple":11.2,
+             "publishing_pct":56,"sync_pct":22,"recording_pct":22,"stream_trend_3yr":[10.4,12.1,14.2],"sync_placements":310,
+             "notes":"Critically acclaimed free mixtape. Strong publishing retention at low multiple."},
+            {"title":"Coloring Book","year":2016,"tracks":14,"annual_revenue_K":2100,"psr_multiple":14.8,
+             "publishing_pct":58,"sync_pct":24,"recording_pct":18,"stream_trend_3yr":[28.4,30.1,32.8],"sync_placements":540,
+             "notes":"First Grammy-winning streaming-only album. Owns 100% — exceptional investor exposure."},
+            {"title":"The Big Day","year":2019,"tracks":22,"annual_revenue_K":880,"psr_multiple":12.4,
+             "publishing_pct":52,"sync_pct":18,"recording_pct":30,"stream_trend_3yr":[12.4,11.8,11.2],"sync_placements":180,
+             "notes":"Mixed reception. Slight stream decline but valuation remains fair."},
+        ]
+    },
+    "frank-ocean": {
+        "name":"Frank Ocean","genre":["R&B","Neo-Soul","Indie R&B"],
+        "active_years":"2009–present","catalog_size":42,"monthly_streams_M":38.4,
+        "image_placeholder":"FO","independent":True,"label":"Boys Don't Cry (own label)",
+        "bio":"Owns 100% of Blonde — self-released on own label. One of the most valuable indie R&B catalogs in existence.",
+        "albums":[
+            {"title":"Nostalgia, Ultra","year":2011,"tracks":11,"annual_revenue_K":880,"psr_multiple":12.8,
+             "publishing_pct":48,"sync_pct":28,"recording_pct":24,"stream_trend_3yr":[14.2,16.8,20.4],"sync_placements":560,
+             "notes":"Free mixtape now on streaming. Publishing retained. Growing catalog value."},
+            {"title":"channel ORANGE","year":2012,"tracks":17,"annual_revenue_K":3400,"psr_multiple":16.2,
+             "publishing_pct":50,"sync_pct":30,"recording_pct":20,"stream_trend_3yr":[42.1,46.8,54.2],"sync_placements":1240,
+             "notes":"Grammy AOTY. High sync demand. Premium but justified."},
+            {"title":"Blonde","year":2016,"tracks":17,"annual_revenue_K":5800,"psr_multiple":19.4,
+             "publishing_pct":55,"sync_pct":26,"recording_pct":19,"stream_trend_3yr":[62.4,68.8,78.4],"sync_placements":1820,
+             "notes":"100% self-owned. Rarest asset — a #1 album owned outright by the artist."},
+        ]
+    },
+    "hozier": {
+        "name":"Hozier","genre":["Indie Folk","Blues Rock","Alternative"],
+        "active_years":"2013–present","catalog_size":52,"monthly_streams_M":32.6,
+        "image_placeholder":"HZ","independent":True,"label":"Rubyworks / Columbia (dist.)",
+        "bio":"Retains publishing through Rubyworks indie deal. 'Take Me to Church' is one of the most-licensed songs of the decade.",
+        "albums":[
+            {"title":"Hozier","year":2014,"tracks":13,"annual_revenue_K":4200,"psr_multiple":16.8,
+             "publishing_pct":58,"sync_pct":32,"recording_pct":10,"stream_trend_3yr":[48.4,54.2,62.8],"sync_placements":2240,
+             "notes":"'Take Me to Church' — 2B+ streams, 3,000+ sync placements. Catalog anchor."},
+            {"title":"Wasteland, Baby!","year":2019,"tracks":14,"annual_revenue_K":2400,"psr_multiple":14.2,
+             "publishing_pct":56,"sync_pct":30,"recording_pct":14,"stream_trend_3yr":[28.4,32.8,38.4],"sync_placements":1080,
+             "notes":"Grammy-nominated. #1 UK/Ireland. Strong sync profile."},
+            {"title":"Unreal Unearth","year":2023,"tracks":14,"annual_revenue_K":3200,"psr_multiple":15.4,
+             "publishing_pct":55,"sync_pct":28,"recording_pct":17,"stream_trend_3yr":[38.4,48.2,62.4],"sync_placements":680,
+             "notes":"Fastest-growing album. 'Too Sweet' topped global charts 2024."},
+        ]
+    },
+    "taylor-swift": {
+        "name":"Taylor Swift","genre":["Pop","Country","Folk"],
+        "active_years":"2006–present","catalog_size":236,"monthly_streams_M":82.4,
+        "image_placeholder":"TS","independent":False,"label":"Republic Records",
+        "bio":"One of the best-selling artists of all time. Owns publishing through Taylor Swift Productions.",
+        "albums":[
+            {"title":"Taylor Swift","year":2006,"tracks":11,"annual_revenue_K":420,"psr_multiple":14.2,
+             "publishing_pct":38,"sync_pct":24,"recording_pct":38,"stream_trend_3yr":[14.1,16.8,20.2],"sync_placements":280,"notes":"Country debut."},
+            {"title":"Fearless","year":2008,"tracks":13,"annual_revenue_K":1840,"psr_multiple":16.8,
+             "publishing_pct":40,"sync_pct":30,"recording_pct":30,"stream_trend_3yr":[42.1,48.7,56.4],"sync_placements":820,"notes":"Grammy AOTY. 'Love Story' top sync earner."},
+            {"title":"1989","year":2014,"tracks":13,"annual_revenue_K":3100,"psr_multiple":17.2,
+             "publishing_pct":40,"sync_pct":25,"recording_pct":35,"stream_trend_3yr":[68.4,74.2,88.1],"sync_placements":1240,"notes":"Full pop pivot. 'Shake It Off' lifetime earner."},
+            {"title":"Folklore","year":2020,"tracks":16,"annual_revenue_K":3400,"psr_multiple":16.4,
+             "publishing_pct":48,"sync_pct":28,"recording_pct":24,"stream_trend_3yr":[61.4,67.8,74.2],"sync_placements":920,"notes":"Indie-folk pivot. High publishing split — excellent for investors."},
+            {"title":"Midnights","year":2022,"tracks":13,"annual_revenue_K":5600,"psr_multiple":24.5,
+             "publishing_pct":42,"sync_pct":18,"recording_pct":40,"stream_trend_3yr":[90.1,110.4,138.7],"sync_placements":490,"notes":"Highest revenue album. Premium multiple."},
+        ]
+    },
+    "kendrick-lamar": {
+        "name":"Kendrick Lamar","genre":["Hip-Hop","Rap","West Coast"],
+        "active_years":"2009–present","catalog_size":98,"monthly_streams_M":44.1,
+        "image_placeholder":"KL","independent":False,"label":"pgLang / Interscope",
+        "bio":"Pulitzer Prize winner. Deep critical prestige drives sync in film/TV at premium license rates.",
+        "albums":[
+            {"title":"good kid, m.A.A.d city","year":2012,"tracks":12,"annual_revenue_K":2200,"psr_multiple":14.3,
+             "publishing_pct":48,"sync_pct":26,"recording_pct":26,"stream_trend_3yr":[38.4,41.7,46.3],"sync_placements":680,"notes":"8× Platinum. Evergreen streaming with 10+ year staying power."},
+            {"title":"To Pimp a Butterfly","year":2015,"tracks":16,"annual_revenue_K":1900,"psr_multiple":13.1,
+             "publishing_pct":52,"sync_pct":30,"recording_pct":18,"stream_trend_3yr":[28.1,31.4,35.8],"sync_placements":920,"notes":"Pulitzer-level prestige. Highest sync % — jazz samples drive premium placements."},
+            {"title":"DAMN.","year":2017,"tracks":14,"annual_revenue_K":3400,"psr_multiple":15.7,
+             "publishing_pct":44,"sync_pct":24,"recording_pct":32,"stream_trend_3yr":[52.4,56.1,61.9],"sync_placements":770,"notes":"First rap album to win Pulitzer Prize. Grammy AOTY."},
+            {"title":"GNX","year":2024,"tracks":12,"annual_revenue_K":3100,"psr_multiple":19.4,
+             "publishing_pct":44,"sync_pct":16,"recording_pct":40,"stream_trend_3yr":[58.4,78.2,92.1],"sync_placements":90,"notes":"Surprise drop. 'Not Like Us' dominant — too new for sync data."},
+        ]
+    },
+}
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/api/artists")
+def list_artists():
+    out = []
+    for key, a in ARTISTS.items():
+        scores = [score_album(al) for al in a["albums"]]
+        avg = round(sum(scores)/len(scores))
+        out.append({"key":key,"name":a["name"],"genre":a["genre"],
+                    "monthly_streams_M":a["monthly_streams_M"],"catalog_size":a["catalog_size"],
+                    "album_count":len(a["albums"]),"image_placeholder":a["image_placeholder"],
+                    "independent":a.get("independent",False),"label":a.get("label",""),
+                    "avg_score":avg,"verdict":verdict(avg)})
+    out.sort(key=lambda x:(x["independent"],x["avg_score"]),reverse=True)
+    return jsonify(out)
+
+@app.route("/api/artist/<key>")
+def get_artist(key):
+    a = ARTISTS.get(key)
+    if not a: return jsonify({"error":"not found"}),404
+    albums = [{**al,"score":score_album(al),"verdict":verdict(score_album(al))} for al in a["albums"]]
+    avg = round(sum(x["score"] for x in albums)/len(albums))
+    return jsonify({**a,"key":key,"simulated":False,"albums":albums,"overall_score":avg,"overall_verdict":verdict(avg)})
+
+@app.route("/api/search")
+def search():
+    q = request.args.get("q","").lower().strip()
+    out = []
+    for key, a in ARTISTS.items():
+        if q in a["name"].lower() or any(q in g.lower() for g in a["genre"]):
+            scores = [score_album(al) for al in a["albums"]]
+            avg = round(sum(scores)/len(scores))
+            out.append({"key":key,"name":a["name"],"genre":a["genre"],
+                        "image_placeholder":a["image_placeholder"],"independent":a.get("independent",False),
+                        "avg_score":avg,"verdict":verdict(avg),"simulated":False})
+    return jsonify(out)
+
+@app.route("/api/lookup")
+def lookup():
+    name = request.args.get("name","").strip()
+    if not name: return jsonify({"error":"name required"}),400
+    slug = name.lower().replace(" ","-")
+    if slug in ARTISTS: return get_artist(slug)
+    ck = name.lower()
+    if ck in _LOOKUP_CACHE: return jsonify(_LOOKUP_CACHE[ck])
+    profile = _fetch_itunes(name)
+    if not profile:
+        return jsonify({"error":f"Artist '{name}' not found"}),404
+    _LOOKUP_CACHE[ck] = profile
+    return jsonify(profile)
+
+def _parse_tracks(results):
+    tracks = []
+    for item in results:
+        if item.get("wrapperType")=="track" and item.get("kind")=="song":
+            ms = item.get("trackTimeMillis",0)
+            tracks.append({"number":item.get("trackNumber",0),"name":item.get("trackName","Unknown"),
+                           "duration":f"{ms//60000}:{(ms%60000)//1000:02d}" if ms else "—",
+                           "preview":item.get("previewUrl","")})
+    return sorted(tracks, key=lambda t: t["number"])
+
+@app.route("/api/album_tracks")
+def album_tracks():
+    aid = request.args.get("id","").strip()
+    if not aid: return jsonify([])
+    if aid in _TRACK_CACHE: return jsonify(_TRACK_CACHE[aid])
+    try:
+        with urllib.request.urlopen(f"https://itunes.apple.com/lookup?id={aid}&entity=song",timeout=10) as r:
+            data = json_mod.loads(r.read().decode())
+        tracks = _parse_tracks(data.get("results",[]))
+        _TRACK_CACHE[aid] = tracks
+        return jsonify(tracks)
+    except: return jsonify([])
+
+@app.route("/api/album_tracks_by_name")
+def album_tracks_by_name():
+    artist = request.args.get("artist","").strip()
+    album  = request.args.get("album","").strip()
+    if not artist or not album: return jsonify([])
+    ck = f"{artist.lower()}::{album.lower()}"
+    if ck in _TRACK_CACHE: return jsonify(_TRACK_CACHE[ck])
+    try:
+        q = urllib.parse.quote(f"{artist} {album}")
+        with urllib.request.urlopen(f"https://itunes.apple.com/search?term={q}&entity=album&limit=10&media=music",timeout=10) as r:
+            sr = json_mod.loads(r.read().decode())
+        results = sr.get("results",[])
+        if not results: return jsonify([])
+        best = max(results, key=lambda r: len(set(r.get("collectionName","").lower().split()) & set(album.lower().split())))
+        aid = best["collectionId"]
+        with urllib.request.urlopen(f"https://itunes.apple.com/lookup?id={aid}&entity=song",timeout=10) as r:
+            data = json_mod.loads(r.read().decode())
+        tracks = _parse_tracks(data.get("results",[]))
+        _TRACK_CACHE[ck] = tracks; _TRACK_CACHE[str(aid)] = tracks
+        return jsonify(tracks)
+    except: return jsonify([])
+
+# ── HTML Template ─────────────────────────────────────────────────────────────
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>CatalogIQ — Music Catalog Valuation</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;600;700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet"/>
+<style>
+:root{--blue:#00d4ff;--blue2:#0080ff;--blue-dim:rgba(0,212,255,.12);--blue-glow:0 0 20px rgba(0,212,255,.4);
+--green:#00ff88;--green2:#00cc6a;--green-dim:rgba(0,255,136,.12);--green-glow:0 0 20px rgba(0,255,136,.4);
+--red:#ff2d55;--red2:#cc1f40;--red-dim:rgba(255,45,85,.12);--red-glow:0 0 20px rgba(255,45,85,.4);
+--yellow:#ffcc00;--orange:#ff6b00;--teal:#00e5cc;
+--bg:#020408;--surface:rgba(4,12,20,.95);--border:rgba(0,212,255,.15);--border-b:rgba(0,212,255,.4);
+--text:#c8e8f0;--text2:#4a7a90;--text3:#2a4a5a;
+--mono:'Share Tech Mono',monospace;--ui:'Rajdhani',sans-serif;--title:'Orbitron',sans-serif;}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+html{scroll-behavior:smooth;}
+body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:14px;min-height:100vh;overflow-x:hidden;}
+.bg-grid{position:fixed;inset:0;z-index:0;pointer-events:none;
+background-image:linear-gradient(rgba(0,212,255,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,212,255,.03) 1px,transparent 1px);background-size:40px 40px;}
+.bg-scan{position:fixed;inset:0;z-index:0;pointer-events:none;
+background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.08) 2px,rgba(0,0,0,.08) 4px);}
+.corner{position:fixed;z-index:5;pointer-events:none;width:24px;height:24px;}
+.corner::before,.corner::after{content:'';position:absolute;background:var(--blue);}
+.corner::before{width:2px;height:100%}.corner::after{width:100%;height:2px}
+.c-tl{top:16px;left:16px}.c-tl::before{top:0;left:0}.c-tl::after{top:0;left:0}
+.c-tr{top:16px;right:16px}.c-tr::before{top:0;right:0}.c-tr::after{top:0;right:0}
+.c-bl{bottom:16px;left:16px}.c-bl::before{bottom:0;left:0}.c-bl::after{bottom:0;left:0}
+.c-br{bottom:16px;right:16px}.c-br::before{bottom:0;right:0}.c-br::after{bottom:0;right:0}
+header{position:sticky;top:0;z-index:100;background:rgba(2,6,12,.96);border-bottom:1px solid var(--border);backdrop-filter:blur(12px);}
+.hdr{max-width:1400px;margin:0 auto;padding:12px 28px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;}
+.logo{display:flex;align-items:center;gap:14px;}
+.logo-icon{position:relative;width:36px;height:36px;flex-shrink:0;}
+.logo-pulse{position:absolute;inset:-6px;border-radius:50%;border:1px solid var(--blue);opacity:.3;animation:pr 2s ease-out infinite;}
+@keyframes pr{0%{transform:scale(.85);opacity:.5}100%{transform:scale(1.3);opacity:0}}
+.logo-t{font-family:var(--title);font-size:20px;font-weight:900;color:var(--blue);letter-spacing:3px;text-shadow:var(--blue-glow);}
+.logo-t span{color:var(--green);text-shadow:var(--green-glow);}
+.logo-s{font-family:var(--mono);font-size:9px;color:var(--text2);letter-spacing:1px;margin-top:2px;}
+.hdr-c{flex:1;display:flex;justify-content:center;}
+.sys{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--text2);}
+.sdot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:var(--green-glow);animation:bk 2s ease-in-out infinite;}
+@keyframes bk{0%,100%{opacity:1}50%{opacity:.3}}
+.search-wrap{position:relative;}
+.search-bar{position:relative;display:flex;align-items:center;border:1px solid var(--border-b);border-radius:4px;background:rgba(0,20,40,.6);padding:0 12px;transition:all .2s;}
+.search-bar:focus-within{border-color:var(--blue);box-shadow:0 0 0 1px var(--blue),var(--blue-glow);}
+.search-bar input{background:none;border:none;outline:none;color:var(--text);font-family:var(--mono);font-size:12px;padding:9px 0;width:240px;letter-spacing:1px;}
+.search-bar input::placeholder{color:var(--text2);}
+.s-icon{color:var(--blue);font-size:18px;margin-right:8px;}
+.dropdown{position:absolute;top:calc(100% + 8px);left:0;right:0;background:rgba(2,8,16,.98);border:1px solid var(--border-b);border-radius:4px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.8),var(--blue-glow);z-index:200;}
+.dropdown.hidden{display:none;}
+.sr-item{display:flex;align-items:center;gap:12px;padding:10px 14px;cursor:pointer;border-bottom:1px solid rgba(0,212,255,.06);transition:background .15s;}
+.sr-item:hover{background:var(--blue-dim);}
+.sr-av{width:34px;height:34px;border-radius:2px;background:linear-gradient(135deg,var(--blue2),var(--blue));display:flex;align-items:center;justify-content:center;font-family:var(--title);font-weight:700;font-size:10px;color:var(--bg);flex-shrink:0;}
+.sr-name{font-weight:700;font-size:13px;color:var(--text);}
+.sr-sub{font-family:var(--mono);font-size:10px;color:var(--text2);}
+main{max-width:1400px;margin:0 auto;padding:32px 28px;position:relative;z-index:2;}
+.hidden{display:none!important;}
+.vt{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:8px;}
+.vt-title{font-family:var(--title);font-size:14px;font-weight:700;color:var(--blue);letter-spacing:3px;text-shadow:var(--blue-glow);}
+.vt-sub{font-family:var(--mono);font-size:11px;color:var(--text2);margin-bottom:14px;line-height:1.6;}
+.hline{height:1px;background:linear-gradient(90deg,var(--blue),transparent);opacity:.4;margin-bottom:28px;}
+.filter-row{display:flex;gap:8px;flex-wrap:wrap;}
+.fbtn{background:none;border:1px solid var(--border);color:var(--text2);font-family:var(--mono);font-size:10px;padding:6px 14px;border-radius:2px;cursor:pointer;letter-spacing:1px;display:flex;align-items:center;gap:6px;transition:all .2s;}
+.fbtn:hover,.fbtn.active{border-color:var(--blue);color:var(--blue);background:var(--blue-dim);}
+.fbtn[data-f="indie"].active{border-color:var(--green);color:var(--green);background:var(--green-dim);}
+.idot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:bk 2s ease-in-out infinite;}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px;}
+.card{background:rgba(0,10,20,.8);border:1px solid var(--border);border-radius:4px;padding:20px;cursor:pointer;position:relative;overflow:hidden;transition:all .25s;}
+.card:hover{border-color:var(--blue);box-shadow:0 0 0 1px rgba(0,212,255,.2),var(--blue-glow),0 8px 32px rgba(0,0,0,.5);transform:translateY(-2px);}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--blue),transparent);opacity:0;transition:opacity .25s;}
+.card:hover::before{opacity:1;}
+.c-top{display:flex;align-items:center;gap:14px;margin-bottom:18px;}
+.c-av{width:48px;height:48px;border-radius:2px;flex-shrink:0;background:linear-gradient(135deg,rgba(0,128,255,.8),rgba(0,212,255,.6));border:1px solid var(--blue);display:flex;align-items:center;justify-content:center;font-family:var(--title);font-weight:900;font-size:12px;color:var(--bg);letter-spacing:2px;}
+.c-name{font-family:var(--title);font-size:13px;font-weight:700;color:var(--text);letter-spacing:1px;}
+.c-genre{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:3px;}
+.c-metrics{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px;}
+.cm{text-align:center;}
+.cm-v{font-family:var(--mono);font-size:16px;color:var(--blue);}
+.cm-l{font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;margin-top:2px;}
+.c-score{display:flex;align-items:center;gap:10px;margin-bottom:12px;}
+.cs-n{font-family:var(--mono);font-size:24px;min-width:38px;text-align:right;}
+.cs-b{flex:1;}
+.cs-track{height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden;}
+.cs-fill{height:100%;border-radius:2px;transition:width .8s ease;}
+.cs-lbl{font-family:var(--mono);font-size:9px;color:var(--text2);margin-top:3px;}
+.c-verdict{display:flex;align-items:center;justify-content:space-between;}
+.c-alt{font-family:var(--mono);font-size:10px;color:var(--text2);}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:2px;font-family:var(--mono);font-size:10px;font-weight:400;letter-spacing:1px;text-transform:uppercase;}
+.badge.green{background:var(--green-dim);color:var(--green);border:1px solid rgba(0,255,136,.3);}
+.badge.teal{background:rgba(0,229,204,.1);color:var(--teal);border:1px solid rgba(0,229,204,.3);}
+.badge.yellow{background:rgba(255,204,0,.1);color:var(--yellow);border:1px solid rgba(255,204,0,.3);}
+.badge.orange{background:rgba(255,107,0,.1);color:var(--orange);border:1px solid rgba(255,107,0,.3);}
+.badge.red{background:var(--red-dim);color:var(--red);border:1px solid rgba(255,45,85,.3);}
+.indie-badge{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:9px;color:var(--green);letter-spacing:1px;padding:2px 8px;background:var(--green-dim);border:1px solid rgba(0,255,136,.25);border-radius:2px;}
+.indie-bd{width:5px;height:5px;border-radius:50%;background:var(--green);}
+.sim-banner{background:rgba(255,204,0,.06);border:1px solid rgba(255,204,0,.3);border-radius:4px;padding:12px 18px;margin-bottom:20px;display:flex;align-items:flex-start;gap:12px;}
+.sb-icon{font-size:18px;flex-shrink:0;}
+.sb-text{font-family:var(--mono);font-size:11px;color:var(--yellow);line-height:1.6;}
+.sb-title{font-weight:700;letter-spacing:1px;margin-bottom:3px;}
+.sb-sub{color:rgba(255,204,0,.6);font-size:10px;}
+.loading{grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:14px;padding:80px;font-family:var(--mono);font-size:12px;color:var(--text2);letter-spacing:2px;}
+.ring{width:28px;height:28px;border:2px solid var(--text3);border-top-color:var(--blue);border-radius:50%;animation:sp .8s linear infinite;}
+@keyframes sp{to{transform:rotate(360deg)}}
+.detail-nav{display:flex;align-items:center;gap:20px;margin-bottom:24px;}
+.back-btn{background:none;border:1px solid var(--border-b);color:var(--text2);font-family:var(--mono);font-size:11px;padding:8px 16px;border-radius:4px;cursor:pointer;letter-spacing:1px;transition:all .2s;}
+.back-btn:hover{border-color:var(--blue);color:var(--blue);}
+.bc{font-family:var(--mono);font-size:11px;}
+.bc-d{color:var(--text3)}.bc-s{color:var(--text3);margin:0 4px}.bc-c{color:var(--blue)}
+.hero{background:rgba(0,10,20,.8);border:1px solid var(--border-b);border-radius:4px;padding:28px 32px;display:flex;align-items:flex-start;gap:28px;flex-wrap:wrap;margin-bottom:20px;position:relative;overflow:hidden;}
+.hero::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--blue),var(--green),transparent);}
+.h-av{width:72px;height:72px;border-radius:2px;flex-shrink:0;background:linear-gradient(135deg,var(--blue2),var(--blue));border:1px solid var(--blue);display:flex;align-items:center;justify-content:center;font-family:var(--title);font-weight:900;font-size:18px;color:var(--bg);letter-spacing:2px;box-shadow:var(--blue-glow);}
+.h-info{flex:1;min-width:220px;}
+.h-name{font-family:var(--title);font-size:22px;font-weight:900;color:var(--text);letter-spacing:2px;margin-bottom:4px;}
+.h-meta{font-family:var(--mono);font-size:11px;color:var(--text2);margin-bottom:10px;}
+.h-bio{font-size:13px;color:var(--text2);line-height:1.6;max-width:560px;}
+.h-right{display:flex;flex-direction:column;align-items:flex-end;gap:8px;margin-left:auto;}
+.h-slbl{font-family:var(--mono);font-size:9px;color:var(--text2);letter-spacing:2px;}
+.h-snum{font-family:var(--title);font-size:56px;font-weight:900;line-height:1;text-align:right;}
+.h-snum.green{color:var(--green);text-shadow:var(--green-glow)}.h-snum.teal{color:var(--teal)}.h-snum.yellow{color:var(--yellow)}.h-snum.orange{color:var(--orange)}.h-snum.red{color:var(--red);text-shadow:var(--red-glow)}
+.stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:24px;}
+.stat{background:rgba(0,10,20,.8);border:1px solid var(--border);border-radius:4px;padding:14px 16px;}
+.st-v{font-family:var(--mono);font-size:20px;color:var(--blue);}
+.st-l{font-family:var(--mono);font-size:9px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-top:4px;}
+.al-hdr{display:flex;align-items:center;gap:12px;margin-bottom:16px;}
+.al-hdr-t{font-family:var(--title);font-size:11px;font-weight:700;color:var(--blue);letter-spacing:2px;}
+.al-hdr-l{flex:1;height:1px;background:var(--border);}
+.al-hdr-c{font-family:var(--mono);font-size:10px;color:var(--text2);}
+.album-list{display:flex;flex-direction:column;gap:12px;}
+.album-row{background:rgba(0,8,18,.85);border:1px solid var(--border);border-radius:4px;padding:18px 22px;position:relative;overflow:hidden;transition:border-color .2s;}
+.album-row::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;}
+.album-row.green::before{background:var(--green)}.album-row.teal::before{background:var(--teal)}.album-row.yellow::before{background:var(--yellow)}.album-row.orange::before{background:var(--orange)}.album-row.red::before{background:var(--red)}
+.al-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px;flex-wrap:wrap;}
+.al-title{font-family:var(--title);font-size:14px;font-weight:700;color:var(--text);letter-spacing:1px;}
+.al-sub{font-family:var(--mono);font-size:10px;color:var(--text2);margin-top:3px;}
+.al-notes{font-size:12px;color:var(--text2);margin-top:5px;font-style:italic;line-height:1.5;}
+.al-vc{display:flex;align-items:center;gap:10px;flex-shrink:0;}
+.al-sb{font-family:var(--title);font-size:22px;font-weight:900;}
+.al-sb.green{color:var(--green)}.al-sb.teal{color:var(--teal)}.al-sb.yellow{color:var(--yellow)}.al-sb.orange{color:var(--orange)}.al-sb.red{color:var(--red)}
+.al-data{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-bottom:14px;}
+.dc{background:rgba(0,20,40,.4);border:1px solid var(--border);border-radius:2px;padding:10px 12px;}
+.dc-v{font-family:var(--mono);font-size:15px;color:var(--text);}
+.dc-l{font-family:var(--mono);font-size:9px;color:var(--text2);text-transform:uppercase;margin-top:3px;}
+.dc-v.up{color:var(--green)}.dc-v.down{color:var(--red)}
+.psr-b{margin-bottom:10px;}
+.psr-h{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--text2);margin-bottom:6px;}
+.psr-bar{display:flex;height:8px;border-radius:2px;overflow:hidden;gap:2px;}
+.psr-seg{height:100%;}
+.psr-seg.pub{background:var(--blue2)}.psr-seg.sync{background:var(--green2)}.psr-seg.rec{background:var(--red2)}
+.psr-leg{display:flex;gap:16px;margin-top:6px;font-family:var(--mono);font-size:10px;color:var(--text2);}
+.pd{display:inline-block;width:6px;height:6px;border-radius:1px;margin-right:5px;vertical-align:middle;}
+.spark-b{margin-top:4px;}
+.spark-l{font-family:var(--mono);font-size:9px;color:var(--text2);text-transform:uppercase;margin-bottom:6px;}
+.sparkline{display:flex;align-items:flex-end;gap:3px;height:32px;}
+.sp-bar{flex:1;border-radius:1px 1px 0 0;min-width:10px;}
+.sp-bar.up{background:rgba(0,255,136,.6)}.sp-bar.down{background:rgba(255,45,85,.6)}.sp-bar.flat{background:rgba(255,204,0,.5)}
+.spark-vals{display:flex;justify-content:space-between;font-family:var(--mono);font-size:8px;color:var(--text3);margin-top:3px;}
+.sm-b{margin-top:12px;}
+.sm-track{height:3px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden;}
+.sm-fill{height:100%;border-radius:2px;transition:width .8s ease;}
+.sm-fill.green{background:var(--green)}.sm-fill.teal{background:var(--teal)}.sm-fill.yellow{background:var(--yellow)}.sm-fill.orange{background:var(--orange)}.sm-fill.red{background:var(--red)}
+.sm-ns{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9px;color:var(--text3);margin-top:3px;}
+.track-toggle{display:flex;align-items:center;gap:8px;background:none;border:1px solid var(--border);color:var(--text2);font-family:var(--mono);font-size:10px;padding:6px 14px;border-radius:2px;cursor:pointer;letter-spacing:1px;margin-top:12px;transition:all .2s;}
+.track-toggle:hover,.track-toggle.open{border-color:var(--blue);color:var(--blue);background:var(--blue-dim);}
+.tt-arr{transition:transform .2s;display:inline-block;}
+.track-toggle.open .tt-arr{transform:rotate(90deg);}
+.track-list{display:none;margin-top:12px;border:1px solid var(--border);border-radius:2px;overflow:hidden;}
+.track-list.visible{display:block;}
+.tl-hdr{display:grid;grid-template-columns:28px 1fr 56px 24px;padding:6px 14px;font-family:var(--mono);font-size:9px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border);background:rgba(0,0,0,.3);}
+.track-row{display:grid;grid-template-columns:28px 1fr 56px 24px;padding:8px 14px;align-items:center;border-bottom:1px solid rgba(0,212,255,.04);transition:background .12s;}
+.track-row:hover{background:rgba(0,212,255,.04);}
+.t-num{font-family:var(--mono);font-size:10px;color:var(--text3);}
+.t-name{font-family:var(--ui);font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:12px;}
+.t-dur{font-family:var(--mono);font-size:10px;color:var(--text2);text-align:right;}
+.prev-btn{background:none;border:none;cursor:pointer;color:var(--text3);font-size:12px;padding:2px 4px;border-radius:2px;transition:color .15s;line-height:1;}
+.prev-btn:hover,.prev-btn.playing{color:var(--green);}
+.t-loading{padding:14px;text-align:center;font-family:var(--mono);font-size:10px;color:var(--text2);letter-spacing:1px;}
+.legend-btn{position:fixed;bottom:28px;right:28px;z-index:400;width:44px;height:44px;background:var(--bg);border:1px solid var(--blue);color:var(--blue);border-radius:2px;display:flex;align-items:center;justify-content:center;font-family:var(--title);font-size:18px;cursor:pointer;box-shadow:var(--blue-glow);}
+.modal{position:fixed;inset:0;z-index:500;background:rgba(0,4,10,.85);display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(6px);}
+.modal.hidden{display:none!important;}
+.mbox{background:rgba(2,8,18,.98);border:1px solid var(--border-b);border-radius:4px;max-width:580px;width:100%;box-shadow:var(--blue-glow),0 24px 64px rgba(0,0,0,.8);position:relative;overflow:hidden;}
+.mbox::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--blue),var(--green),var(--blue));}
+.m-hdr{display:flex;align-items:center;justify-content:space-between;padding:20px 24px 16px;}
+.m-title{font-family:var(--mono);font-size:12px;color:var(--blue);letter-spacing:2px;}
+.m-close{background:none;border:none;color:var(--text2);font-size:16px;cursor:pointer;}
+.m-line{height:1px;background:var(--border);margin:0 24px;}
+.m-body{padding:20px 24px 24px;}
+.m-desc{font-family:var(--mono);font-size:11px;color:var(--text2);margin-bottom:16px;line-height:1.6;}
+.leg-t{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:20px;}
+.leg-t th{font-family:var(--mono);font-size:9px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);}
+.leg-t td{padding:8px;border-bottom:1px solid rgba(0,212,255,.05);font-family:var(--ui);color:var(--text2);}
+.leg-t td:first-child{color:var(--text);font-weight:600;min-width:140px;}
+.bt{color:var(--blue)!important;font-family:var(--mono)!important;}
+.vref{display:flex;flex-direction:column;gap:8px;}
+.vref-row{display:flex;align-items:center;gap:12px;font-family:var(--mono);font-size:11px;color:var(--text2);}
+@media(max-width:700px){.hdr{padding:12px 16px;gap:12px;}.hdr-c{display:none;}.search-bar input{width:180px;}main{padding:20px 16px;}.hero{padding:20px;}.h-right{align-items:flex-start;}}
+</style>
+</head>
+<body>
+<div class="bg-grid"></div><div class="bg-scan"></div>
+<div class="corner c-tl"></div><div class="corner c-tr"></div><div class="corner c-bl"></div><div class="corner c-br"></div>
+<header>
+<div class="hdr">
+  <div class="logo">
+    <div class="logo-icon">
+      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <circle cx="16" cy="16" r="14" stroke="var(--blue)" stroke-width="1.5"/>
+        <circle cx="16" cy="16" r="8" stroke="var(--blue)" stroke-width="1" stroke-dasharray="3 2"/>
+        <circle cx="16" cy="16" r="3" fill="var(--blue)"/>
+        <line x1="16" y1="2" x2="16" y2="6" stroke="var(--blue)" stroke-width="1.5"/>
+        <line x1="16" y1="26" x2="16" y2="30" stroke="var(--blue)" stroke-width="1.5"/>
+        <line x1="2" y1="16" x2="6" y2="16" stroke="var(--blue)" stroke-width="1.5"/>
+        <line x1="26" y1="16" x2="30" y2="16" stroke="var(--blue)" stroke-width="1.5"/>
+      </svg>
+      <div class="logo-pulse"></div>
+    </div>
+    <div><div class="logo-t">CATALOG<span>IQ</span></div><div class="logo-s">// MUSIC CATALOG VALUATION SYSTEM v2.1</div></div>
+  </div>
+  <div class="hdr-c"><div class="sys"><span class="sdot"></span><span>SYSTEM ONLINE</span><span style="color:var(--text3);margin:0 4px">|</span><span id="artistCount">LOADING...</span></div></div>
+  <div class="search-wrap">
+    <div class="search-bar"><span class="s-icon">⌕</span><input id="searchInput" type="text" placeholder="SEARCH ARTIST / GENRE..." autocomplete="off" spellcheck="false"/></div>
+    <div id="dropdown" class="dropdown hidden"></div>
+  </div>
+</div>
+</header>
+<main>
+  <div id="homeView">
+    <div class="vt">
+      <div class="vt-title">&lt; ARTIST CATALOG INDEX /&gt;</div>
+      <div class="filter-row">
+        <button class="fbtn active" data-f="all">ALL</button>
+        <button class="fbtn" data-f="indie"><span class="idot"></span>INDEPENDENT ONLY</button>
+        <button class="fbtn" data-f="major">MAJOR LABEL</button>
+      </div>
+    </div>
+    <div class="vt-sub">Select an artist to load full discography PSR analysis. Search any artist to generate an estimated profile.</div>
+    <div class="hline"></div>
+    <div id="artistGrid" class="grid"><div class="loading"><div class="ring"></div><span>INITIALIZING...</span></div></div>
+  </div>
+  <div id="detailView" class="hidden">
+    <div class="detail-nav">
+      <button id="backBtn" class="back-btn">&#8592; BACK TO INDEX</button>
+      <div class="bc"><span class="bc-d">INDEX</span><span class="bc-s">/</span><span id="bcArtist" class="bc-c"></span></div>
+    </div>
+    <div id="detailContent"></div>
+  </div>
+</main>
+<button id="legendBtn" class="legend-btn" title="Scoring Legend">?</button>
+<div id="legendModal" class="modal hidden">
+  <div class="mbox">
+    <div class="m-hdr"><div class="m-title">// SCORING ALGORITHM REFERENCE</div><button class="m-close" id="legendClose">✕</button></div>
+    <div class="m-line"></div>
+    <div class="m-body">
+      <p class="m-desc">Each album scores 0–100 across four weighted inputs. Artist score = catalog average.</p>
+      <table class="leg-t"><thead><tr><th>INPUT</th><th>WEIGHT</th><th>SIGNAL</th></tr></thead><tbody>
+        <tr><td>PSR Multiple</td><td class="bt">40 pts</td><td>&lt;12× undervalued · 12–18× fair · &gt;20× overpriced</td></tr>
+        <tr><td>Stream Trend</td><td class="bt">30 pts</td><td>3-year streaming direction</td></tr>
+        <tr><td>Sync Placements</td><td class="bt">15 pts</td><td>TV/film/ad licensing count</td></tr>
+        <tr><td>Revenue Mix</td><td class="bt">15 pts</td><td>Publishing + Sync %. Higher = platform-independent income</td></tr>
+      </tbody></table>
+      <div class="vref">
+        <div class="vref-row"><span class="badge green">▲ STRONG BUY</span><span>78–100 · Undervalued with strong growth</span></div>
+        <div class="vref-row"><span class="badge teal">▲ BUY</span><span>62–77 · Solid risk/reward</span></div>
+        <div class="vref-row"><span class="badge yellow">◆ MONITOR</span><span>48–61 · Watch stream trends</span></div>
+        <div class="vref-row"><span class="badge orange">▼ PASS</span><span>35–47 · Overvalued or deteriorating</span></div>
+        <div class="vref-row"><span class="badge red">▼ STRONG PASS</span><span>0–34 · Multiple red flags</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+let _audio=null,_playBtn=null;
+function playPreview(url,btn){
+  if(_audio){_audio.pause();_audio=null;}
+  if(_playBtn){_playBtn.classList.remove('playing');_playBtn.textContent='▷';}
+  if(_playBtn===btn){_playBtn=null;return;}
+  _audio=new Audio(url);_audio.volume=.6;_audio.play();
+  _audio.onended=()=>{btn.classList.remove('playing');btn.textContent='▷';_playBtn=null;};
+  btn.classList.add('playing');btn.textContent='■';_playBtn=btn;
+}
+
+const homeView=document.getElementById('homeView'),detailView=document.getElementById('detailView'),
+  artistGrid=document.getElementById('artistGrid'),detailContent=document.getElementById('detailContent'),
+  backBtn=document.getElementById('backBtn'),bcArtist=document.getElementById('bcArtist'),
+  searchInput=document.getElementById('searchInput'),dropdown=document.getElementById('dropdown'),
+  legendBtn=document.getElementById('legendBtn'),legendModal=document.getElementById('legendModal'),
+  legendClose=document.getElementById('legendClose'),artistCount=document.getElementById('artistCount');
+
+let allArtists=[],activeFilter='all';
+
+function badge(v){return `<span class="badge ${v.color}">${v.icon} ${v.label}</span>`;}
+function indieBadge(){return `<span class="indie-badge"><span class="indie-bd"></span>INDEPENDENT</span>`;}
+function cvar(c){return {green:'green',teal:'teal',yellow:'yellow',orange:'orange',red:'red'}[c]||'blue';}
+
+function scoreFill(score,col){return `<div class="sm-b"><div class="sm-track"><div class="sm-fill ${col}" style="width:${score}%"></div></div><div class="sm-ns"><span>0</span><span>SCORE ${score}/100</span><span>100</span></div></div>`;}
+
+function sparkline(trend){
+  const mx=Math.max(...trend);
+  return `<div class="sparkline">${trend.map((v,i)=>{
+    const h=Math.round(v/mx*100);
+    let c='up';if(i>0&&v<trend[i-1])c='down';else if(i>0&&Math.abs(v-trend[i-1])/trend[i-1]<.03)c='flat';
+    return `<div class="sp-bar ${c}" style="height:${h}%" title="${v}M"></div>`;
+  }).join('')}</div><div class="spark-vals"><span>${trend[0]}M</span><span>${trend[Math.floor(trend.length/2)]}M</span><span>${trend[trend.length-1]}M</span></div>`;
+}
+
+function psrBar(pub,sync,rec){return `<div class="psr-b"><div class="psr-h"><span>REVENUE SPLIT  P / S / R</span><span>${pub}% / ${sync}% / ${rec}%</span></div><div class="psr-bar"><div class="psr-seg pub" style="flex:${pub}"></div><div class="psr-seg sync" style="flex:${sync}"></div><div class="psr-seg rec" style="flex:${rec}"></div></div><div class="psr-leg"><span><span class="pd" style="background:#0080ff"></span>Publishing ${pub}%</span><span><span class="pd" style="background:#00cc6a"></span>Sync ${sync}%</span><span><span class="pd" style="background:#cc1f40"></span>Recording ${rec}%</span></div></div>`;}
+
+async function loadArtists(){
+  const res=await fetch('/api/artists');allArtists=await res.json();
+  artistCount.textContent=`${allArtists.length} ARTISTS LOADED`;renderGrid(allArtists);
+}
+
+function renderGrid(artists){
+  if(!artists.length){artistGrid.innerHTML=`<div class="loading" style="grid-column:1/-1"><span style="color:var(--text2);font-family:var(--mono);font-size:12px">NO ARTISTS MATCH FILTER</span></div>`;return;}
+  artistGrid.innerHTML=artists.map(a=>`
+    <div class="card" onclick="openArtist('${a.key}')">
+      <div class="c-top">
+        <div class="c-av" style="${a.independent?'background:linear-gradient(135deg,rgba(0,180,80,.8),rgba(0,255,136,.6));border-color:var(--green)':''}">${a.image_placeholder}</div>
+        <div><div class="c-name">${a.name}</div><div class="c-genre">${a.genre.join(' · ')}</div>${a.label?`<div class="c-genre" style="margin-top:2px;color:var(--text3)">${a.label}</div>`:''}</div>
+      </div>
+      <div style="margin-bottom:12px">${a.independent?indieBadge():`<span style="font-family:var(--mono);font-size:9px;color:var(--text3)">MAJOR LABEL</span>`}</div>
+      <div class="c-metrics">
+        <div class="cm"><div class="cm-v">${a.monthly_streams_M}M</div><div class="cm-l">Monthly Streams</div></div>
+        <div class="cm"><div class="cm-v">${a.catalog_size}</div><div class="cm-l">Catalog Tracks</div></div>
+        <div class="cm"><div class="cm-v">${a.album_count}</div><div class="cm-l">Albums</div></div>
+      </div>
+      <div class="c-score">
+        <div class="cs-n" style="color:var(--${cvar(a.verdict.color)})">${a.avg_score}</div>
+        <div class="cs-b"><div class="cs-track"><div class="cs-fill ${a.verdict.color}" style="width:${a.avg_score}%"></div></div><div class="cs-lbl">INVESTMENT SCORE</div></div>
+      </div>
+      <div class="c-verdict">${badge(a.verdict)}<span class="c-alt">${a.album_count} ALBUMS ON STREAMING</span></div>
+    </div>`).join('');
+}
+
+document.querySelectorAll('.fbtn').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    document.querySelectorAll('.fbtn').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');activeFilter=btn.dataset.f;
+    renderGrid(allArtists.filter(a=>activeFilter==='all'?true:activeFilter==='indie'?a.independent:!a.independent));
+  });
+});
+
+async function openArtist(key,simName){
+  homeView.classList.add('hidden');detailView.classList.remove('hidden');window.scrollTo({top:0,behavior:'smooth'});
+  detailContent.innerHTML=`<div class="loading" style="min-height:300px"><div class="ring"></div><span>LOADING DISCOGRAPHY...</span></div>`;
+  let a;
+  if(simName){const r=await fetch(`/api/lookup?name=${encodeURIComponent(simName)}`);a=await r.json();}
+  else{const r=await fetch(`/api/artist/${key}`);a=await r.json();}
+  renderDetail(a);
+}
+
+function renderDetail(a){
+  bcArtist.textContent=a.name.toUpperCase();
+  const ov=a.overall_verdict;
+  const totalRev=(a.albums.reduce((s,al)=>s+al.annual_revenue_K,0)/1000).toFixed(1);
+  const avgPsr=(a.albums.reduce((s,al)=>s+al.psr_multiple,0)/a.albums.length).toFixed(1);
+  const totalSync=a.albums.reduce((s,al)=>s+al.sync_placements,0).toLocaleString();
+  const simBanner=a.simulated?`<div class="sim-banner"><div class="sb-icon">◈</div><div class="sb-text"><div class="sb-title">// ESTIMATED DATA — NOT IN CATALOG DATABASE</div><div class="sb-sub">PSR multiples and revenue figures are estimates. Verify via DSP analytics before investment decisions.</div></div></div>`:'';
+  detailContent.innerHTML=`${simBanner}
+    <div class="hero">
+      <div class="h-av" style="${a.independent?'background:linear-gradient(135deg,var(--green2),var(--green));border-color:var(--green);box-shadow:var(--green-glow)':''}">${a.image_placeholder}</div>
+      <div class="h-info">
+        <div class="h-name">${a.name.toUpperCase()}</div>
+        <div class="h-meta">${a.genre.join(' · ')}  //  ${a.active_years}  //  ${a.catalog_size} TRACKS</div>
+        <div style="margin:8px 0">${a.independent?indieBadge():`<span style="font-family:var(--mono);font-size:9px;color:var(--text3)">MAJOR LABEL</span>`}${a.label?`<span style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-left:10px">${a.label}</span>`:''}</div>
+        <div class="h-bio">${a.bio}</div>
+      </div>
+      <div class="h-right"><div class="h-slbl">OVERALL SCORE</div><div class="h-snum ${ov.color}">${a.overall_score}</div>${badge(ov)}</div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="st-v">$${totalRev}M</div><div class="st-l">Est. Annual Revenue</div></div>
+      <div class="stat"><div class="st-v">${a.albums.length}</div><div class="st-l">Albums on Streaming</div></div>
+      <div class="stat"><div class="st-v">${a.monthly_streams_M}M</div><div class="st-l">Monthly Streams</div></div>
+      <div class="stat"><div class="st-v">${avgPsr}×</div><div class="st-l">Avg PSR Multiple</div></div>
+      <div class="stat"><div class="st-v">${totalSync}</div><div class="st-l">Total Sync Placements</div></div>
+      <div class="stat"><div class="st-v" style="color:var(--${cvar(ov.color)})">${ov.icon} ${ov.label}</div><div class="st-l">Investment Verdict</div></div>
+    </div>
+    <div class="al-hdr"><div class="al-hdr-t">// FULL DISCOGRAPHY — PSR ANALYSIS</div><div class="al-hdr-l"></div><div class="al-hdr-c">${a.albums.length} ALBUMS</div></div>
+    <div class="album-list">${a.albums.map(al=>albumRow(al,a.name)).join('')}</div>`;
+}
+
+async function toggleTracks(btn,fetchUrl,listEl){
+  const isOpen=btn.classList.contains('open');
+  if(isOpen){btn.classList.remove('open');listEl.classList.remove('visible');return;}
+  btn.classList.add('open');listEl.classList.add('visible');
+  if(listEl.dataset.loaded)return;
+  listEl.innerHTML=`<div class="t-loading">FETCHING TRACK LIST FROM ITUNES...</div>`;
+  const res=await fetch(fetchUrl);const tracks=await res.json();
+  listEl.dataset.loaded='1';
+  if(!tracks.length){listEl.innerHTML=`<div class="t-loading" style="color:var(--text3)">NO TRACK DATA AVAILABLE</div>`;return;}
+  listEl.innerHTML=`<div class="tl-hdr"><span>#</span><span>TITLE</span><span>DURATION</span><span></span></div>${tracks.map(t=>`<div class="track-row"><span class="t-num">${t.number}</span><span class="t-name">${t.name}</span><span class="t-dur">${t.duration}</span><span>${t.preview?`<button class="prev-btn" onclick="playPreview('${t.preview}',this)">▷</button>`:''}</span></div>`).join('')}`;
+}
+
+function albumRow(al,artistName){
+  const v=al.verdict,trend=al.stream_trend_3yr;
+  const pct=((trend[trend.length-1]-trend[0])/trend[0]*100).toFixed(0);
+  const growing=trend[trend.length-1]>=trend[0];
+  const uid=(al.itunes_id||'')+al.title.replace(/[^a-zA-Z0-9]/g,'')+al.year;
+  const fetchUrl=al.itunes_id?`/api/album_tracks?id=${al.itunes_id}`:`/api/album_tracks_by_name?artist=${encodeURIComponent(artistName)}&album=${encodeURIComponent(al.title)}`;
+  const fe=fetchUrl.replace(/'/g,"\\'");
+  return `<div class="album-row ${v.color}">
+    <div class="al-head">
+      <div><div class="al-title">${al.title}</div><div class="al-sub">${al.year}  ·  ${al.tracks} TRACKS</div><div class="al-notes">${al.notes}</div></div>
+      <div class="al-vc"><div class="al-sb ${v.color}">${al.score}</div>${badge(v)}</div>
+    </div>
+    <div class="al-data">
+      <div class="dc"><div class="dc-v">${al.psr_multiple}×</div><div class="dc-l">PSR Multiple</div></div>
+      <div class="dc"><div class="dc-v">$${(al.annual_revenue_K/1000).toFixed(1)}M</div><div class="dc-l">Annual Revenue</div></div>
+      <div class="dc"><div class="dc-v">${al.sync_placements.toLocaleString()}</div><div class="dc-l">Sync Placements</div></div>
+      <div class="dc"><div class="dc-v ${growing?'up':'down'}">${growing?'▲':'▼'} ${Math.abs(pct)}%</div><div class="dc-l">3-Year Stream Trend</div></div>
+      <div class="dc"><div class="dc-v">${trend[trend.length-1]}M</div><div class="dc-l">Current Monthly</div></div>
+      <div class="dc"><div class="dc-v">${al.publishing_pct+al.sync_pct}%</div><div class="dc-l">P+S Income Share</div></div>
+    </div>
+    ${psrBar(al.publishing_pct,al.sync_pct,al.recording_pct)}
+    <div class="spark-b"><div class="spark-l">3-YEAR STREAM TREND (MONTHLY, MILLIONS)</div>${sparkline(al.stream_trend_3yr)}</div>
+    ${scoreFill(al.score,v.color)}
+    <button class="track-toggle" id="ttbtn-${uid}" onclick="toggleTracks(this,'${fe}',document.getElementById('tl-${uid}'))">
+      <span class="tt-arr">▶</span> VIEW TRACK LIST (${al.tracks} TRACKS)
+    </button>
+    <div class="track-list" id="tl-${uid}"></div>
+  </div>`;
+}
+
+backBtn.addEventListener('click',()=>{detailView.classList.add('hidden');homeView.classList.remove('hidden');window.scrollTo({top:0,behavior:'smooth'});});
+
+let sTimer;
+searchInput.addEventListener('input',()=>{
+  clearTimeout(sTimer);const q=searchInput.value.trim();
+  if(!q){dropdown.classList.add('hidden');return;}
+  sTimer=setTimeout(async()=>{
+    const res=await fetch(`/api/search?q=${encodeURIComponent(q)}`);const results=await res.json();
+    let html=results.map(r=>`<div class="sr-item" onclick="selectResult('${r.key}',null)"><div class="sr-av" style="${r.independent?'background:linear-gradient(135deg,rgba(0,180,80,.8),rgba(0,255,136,.6))':''}">${r.image_placeholder}</div><div><div class="sr-name">${r.name}${r.independent?' <span style="font-size:9px;color:var(--green)">★ INDIE</span>':''}</div><div class="sr-sub">${r.genre.join(' · ')}  ·  SCORE: ${r.avg_score}/100</div></div><div style="margin-left:auto">${badge(r.verdict)}</div></div>`).join('');
+    const exact=results.find(r=>r.name.toLowerCase()===q.toLowerCase());
+    if(!exact){const sn=q.replace(/\\/g,'\\\\').replace(/'/g,"\\'");html+=`<div class="sr-item" style="border-top:1px solid var(--border)" onclick="lookupFromInternet('${sn}')"><div class="sr-av" style="background:rgba(0,212,255,.1);border:1px solid var(--blue);color:var(--blue);font-size:18px">⌕</div><div><div class="sr-name" style="color:var(--blue)">Search internet for "${q}"</div><div class="sr-sub">Look up real albums via iTunes · PSR estimates from streaming data</div></div><span style="font-family:var(--mono);font-size:9px;color:var(--blue);margin-left:auto;border:1px solid var(--border);padding:2px 8px">LIVE →</span></div>`;}
+    dropdown.innerHTML=html||`<div style="padding:12px 14px;font-family:var(--mono);font-size:11px;color:var(--text2)">NO LOCAL RESULTS</div>`;
+    dropdown.classList.remove('hidden');
+  },180);
+});
+
+async function lookupFromInternet(name){
+  dropdown.classList.add('hidden');searchInput.value='';
+  homeView.classList.add('hidden');detailView.classList.remove('hidden');
+  bcArtist.textContent=name.toUpperCase();window.scrollTo({top:0,behavior:'smooth'});
+  detailContent.innerHTML=`<div class="loading" style="min-height:400px;flex-direction:column;gap:16px"><div class="ring"></div><span>SEARCHING FOR "${name.toUpperCase()}"...</span><span style="font-size:10px;color:var(--text3)">Fetching real albums from iTunes</span></div>`;
+  try{
+    const res=await fetch(`/api/lookup?name=${encodeURIComponent(name)}`);const data=await res.json();
+    if(data.error)throw new Error(data.error);renderDetail(data);
+  }catch(e){detailContent.innerHTML=`<div class="loading" style="min-height:300px;flex-direction:column;gap:10px"><span style="color:var(--red);font-size:14px">ARTIST NOT FOUND</span><span style="font-size:11px;color:var(--text2)">"${name}" not found on iTunes</span></div>`;}
+}
+
+document.addEventListener('click',e=>{if(!e.target.closest('.search-wrap'))dropdown.classList.add('hidden');});
+function selectResult(key,name){dropdown.classList.add('hidden');searchInput.value='';openArtist(key,name);}
+legendBtn.addEventListener('click',()=>legendModal.classList.remove('hidden'));
+legendClose.addEventListener('click',()=>legendModal.classList.add('hidden'));
+legendModal.addEventListener('click',e=>{if(e.target===legendModal)legendModal.classList.add('hidden');});
+loadArtists();
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5050))
+    app.run(host="0.0.0.0", port=port)
