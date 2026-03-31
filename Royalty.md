@@ -47,5 +47,3 @@ cp .env.example .env
 Run the Application
 bashpython app.py
 
-Then open your browser and navigate to:
-http://localhost:5050
